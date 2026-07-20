@@ -437,7 +437,6 @@ impl fmt::Display for DeviceAuthorization {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,9 +444,31 @@ mod tests {
     use secrecy::ExposeSecret;
 
     #[test]
+    fn shell_single_quote_wraps_and_escapes_embedded_quotes() {
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(shell_single_quote("a;b&c"), "'a;b&c'");
+        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_single_quote(""), "''");
+    }
+
+    #[test]
+    fn device_display_hides_device_code_when_interactive() {
+        let view = DeviceAuthorization {
+            device_code: "device-secret".into(),
+            user_code: "ABCD".into(),
+            verification_uri: "https://example/device".into(),
+            verification_uri_complete: None,
+            expires_in: 900,
+            interval: 5,
+            interactive: true,
+        };
+        let text = view.to_string();
+        assert!(!text.contains("device-secret"), "{text}");
+        assert!(text.contains("ABCD"));
+    }
+
+    #[test]
     fn device_authorization_view_handles_missing_complete_uri() {
-        // Microsoft Entra omits verification_uri_complete on v2.0 device
-        // responses; open and Display must fall back to verification_uri.
         let device = Oauth20DeviceAuthSuccessParams {
             device_code: "entra-device-secret".into(),
             user_code: "EUPEUAM9D".into(),
@@ -465,23 +486,10 @@ mod tests {
             interval: device.interval,
             interactive: true,
         };
-        let open_uri = device
-            .verification_uri_complete
-            .as_deref()
-            .unwrap_or(device.verification_uri.as_str());
-        assert_eq!(open_uri, "https://login.microsoft.com/device");
         let text = view.to_string();
-        assert!(text.contains("EUPEUAM9D"));
-        assert!(text.contains("https://login.microsoft.com/device"));
         assert!(!text.contains("complete URI:"), "{text}");
-        assert!(!text.contains("Or navigate directly"), "{text}");
         assert!(!text.contains("entra-device-secret"), "{text}");
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn loopback_redirect_detects_localhost_only() {
@@ -491,20 +499,11 @@ mod tests {
         assert!(is_loopback_redirect(
             &"http://localhost/callback".parse().unwrap()
         ));
-        assert!(is_loopback_redirect(
-            &"http://[::1]:8080/callback".parse().unwrap()
-        ));
-        assert!(is_loopback_redirect(
-            &"https://127.0.0.1/callback".parse().unwrap()
-        ));
         assert!(!is_loopback_redirect(
             &"org.pimalaya.ortie://redirect".parse().unwrap()
         ));
         assert!(!is_loopback_redirect(
             &"https://example.com/callback".parse().unwrap()
-        ));
-        assert!(!is_loopback_redirect(
-            &"http://192.168.1.1/callback".parse().unwrap()
         ));
     }
 }

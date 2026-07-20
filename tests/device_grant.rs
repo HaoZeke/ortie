@@ -442,7 +442,21 @@ storage.write.command = ["tee", "{t}"]
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!combined.contains(secret), "{combined}");
+    // Clap always quotes the invalid CLI value in `invalid value '…' for
+    // '--pkce'`. Our value_parser message after that must not re-echo the
+    // secret (unit test covers the parser string in isolation).
+    assert!(
+        combined.contains("Invalid 0x") && combined.contains("PKCE code verifier"),
+        "{combined}"
+    );
+    let parser_msg = combined
+        .split("PKCE code verifier")
+        .nth(1)
+        .unwrap_or("");
+    assert!(
+        !parser_msg.contains(secret),
+        "parser message re-echoed verifier: {combined}"
+    );
 }
 
 #[test]

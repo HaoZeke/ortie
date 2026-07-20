@@ -48,9 +48,12 @@ pub struct AuthResumeCommand {
     pub state: Option<Oauth20State>,
 
     /// PKCE verifier from auth get (authorization-code only).
-    #[arg(long, short, value_parser = pkce_code_verifier_parser)]
+    ///
+    /// Stored as a plain string so clap cannot re-echo it on parse
+    /// failure; validated into Oauth20PkceCodeVerifier in execute.
+    #[arg(long, short)]
     #[arg(value_name = "CODE")]
-    pub pkce: Option<Oauth20PkceCodeVerifier>,
+    pub pkce: Option<String>,
 
     /// Redirect URI from auth get (authorization-code only).
     #[arg(long, short, value_parser = uri_parser)]
@@ -64,7 +67,7 @@ impl fmt::Debug for AuthResumeCommand {
         f.debug_struct("AuthResumeCommand")
             .field("input", &"[REDACTED]")
             .field("state", &self.state)
-            .field("pkce", &self.pkce)
+            .field("pkce", &self.pkce.as_ref().map(|_| "[REDACTED]"))
             .field("redirect_uri", &self.redirect_uri)
             .finish()
     }
@@ -102,9 +105,15 @@ impl AuthResumeCommand {
             bail!("Missing endpoints.token in the account config");
         };
 
-        // Never echo self.input: redirect may carry code=/state=.
-        let redirected_uri = Url::parse(&self.input)
-            .map_err(|err| anyhow!("Invalid redirected URI: {err}"))?;
+        // Trim like the device path: shared `input: String` is often
+        // copy-pasted with surrounding whitespace. Never echo the raw
+        // value: the redirect may carry `code=` / `state=` secrets.
+        let input = self.input.trim();
+        if input.is_empty() {
+            bail!("Missing redirected URI (pass it as the positional URI|DEVICE_CODE)");
+        }
+        let redirected_uri =
+            Url::parse(input).map_err(|err| anyhow!("Invalid redirected URI: {err}"))?;
 
         let code = match Oauth20AuthParams::from(&redirected_uri).validate(self.state.as_ref()) {
             Ok(code) => code,
@@ -140,6 +149,14 @@ impl AuthResumeCommand {
                     .map(|uri| Cow::Owned(uri.to_string()))
             });
 
+        let pkce_verifier = match self.pkce.as_deref() {
+            None => None,
+            Some(raw) => Some(
+                pkce_code_verifier_parser(raw)
+                    .map_err(|err| anyhow!(err))?,
+            ),
+        };
+
         let mut client =
             Oauth20ClientStd::connect(token_endpoint, &account.tls, account.client_id.clone())?;
         client.client_secret = client_secret;
@@ -149,7 +166,7 @@ impl AuthResumeCommand {
             redirect_uri,
             client_id: account.client_id.as_str().into(),
             client_secret: None,
-            pkce_code_verifier: self.pkce.as_ref().map(Cow::Borrowed),
+            pkce_code_verifier: pkce_verifier.as_ref().map(Cow::Borrowed),
         })?;
 
         match res {

@@ -159,7 +159,9 @@ impl AuthGetCommand {
         let cmd = AuthResumeCommand {
             input: redirected_uri.to_string(),
             state: Some(state),
-            pkce: pkce_code_challenge.map(|pkce| pkce.verifier),
+            pkce: pkce_code_challenge.map(|pkce| {
+                String::from_utf8_lossy(pkce.verifier.expose()).into_owned()
+            }),
             redirect_uri: Some(redirect_uri.into_owned()),
         };
 

@@ -399,3 +399,85 @@ storage.write.command = ["tee", "{t}"]
     let stored: Value = serde_json::from_str(&std::fs::read_to_string(&token).unwrap()).unwrap();
     assert_eq!(stored["access_token"], "at-test");
 }
+
+#[test]
+fn auth_resume_invalid_pkce_error_omits_verifier_secret() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("c.toml");
+    let token = dir.path().join("t.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[accounts.t]
+client-id = "c"
+grant = "authorization-code"
+endpoints.authorization = "http://127.0.0.1/a"
+endpoints.token = "http://127.0.0.1/t"
+endpoints.redirection = "http://127.0.0.1/cb"
+storage.read.command = ["cat", "{t}"]
+storage.write.command = ["tee", "{t}"]
+"#,
+            t = token.display()
+        ),
+    )
+    .unwrap();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ortie"));
+    let secret = "pkce-verifier-with space-secret";
+    let out = Command::new(&bin)
+        .args([
+            "-c",
+            config.to_str().unwrap(),
+            "auth",
+            "resume",
+            "--pkce",
+            secret,
+            "http://127.0.0.1/cb?code=x&state=y",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!combined.contains(secret), "{combined}");
+}
+
+#[test]
+fn auth_resume_invalid_redirect_error_omits_authorization_code() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("c.toml");
+    let token = dir.path().join("t.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[accounts.t]
+client-id = "c"
+grant = "authorization-code"
+endpoints.authorization = "http://127.0.0.1/a"
+endpoints.token = "http://127.0.0.1/t"
+endpoints.redirection = "http://127.0.0.1/cb"
+storage.read.command = ["cat", "{t}"]
+storage.write.command = ["tee", "{t}"]
+"#,
+            t = token.display()
+        ),
+    )
+    .unwrap();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ortie"));
+    let bad = "not a url?code=auth-code-must-not-leak&state=s";
+    let out = Command::new(&bin)
+        .args(["-c", config.to_str().unwrap(), "auth", "resume", bad])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!combined.contains("auth-code-must-not-leak"), "{combined}");
+}

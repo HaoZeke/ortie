@@ -72,10 +72,20 @@ fn is_expired(issued_at: Option<u64>, expires_in: Option<usize>) -> bool {
 }
 
 /// Printable raw access token, exposed for piping.
-#[derive(Debug, Serialize)]
+///
+/// Display and Serialize intentionally expose the token. Debug redacts.
+#[derive(Serialize)]
 pub struct AccessToken<'a> {
     /// The raw access token string.
     pub access_token: &'a str,
+}
+
+impl fmt::Debug for AccessToken<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessToken")
+            .field("access_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl fmt::Display for AccessToken<'_> {

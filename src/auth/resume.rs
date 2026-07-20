@@ -1,6 +1,6 @@
 //! `auth resume` subcommand: complete an OAuth grant flow.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt};
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
@@ -36,7 +36,7 @@ use crate::{
 ///
 /// Positional input is the redirected URI (authorization-code) or the
 /// device code (device grant).
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 pub struct AuthResumeCommand {
     /// Redirected URI or device code.
     #[arg(value_name = "URI|DEVICE_CODE")]
@@ -55,6 +55,19 @@ pub struct AuthResumeCommand {
     /// Redirect URI from auth get (authorization-code only).
     #[arg(long, short, value_parser = uri_parser)]
     pub redirect_uri: Option<Url>,
+}
+
+// Redact the positional input: device_code or redirect with code=.
+// state / pkce already redact via SecretBox Debug.
+impl fmt::Debug for AuthResumeCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthResumeCommand")
+            .field("input", &"[REDACTED]")
+            .field("state", &self.state)
+            .field("pkce", &self.pkce)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 impl AuthResumeCommand {
@@ -89,8 +102,9 @@ impl AuthResumeCommand {
             bail!("Missing endpoints.token in the account config");
         };
 
+        // Never echo self.input: redirect may carry code=/state=.
         let redirected_uri = Url::parse(&self.input)
-            .map_err(|err| anyhow!("Invalid redirected URI `{}`: {err}", self.input))?;
+            .map_err(|err| anyhow!("Invalid redirected URI: {err}"))?;
 
         let code = match Oauth20AuthParams::from(&redirected_uri).validate(self.state.as_ref()) {
             Ok(code) => code,
@@ -107,11 +121,10 @@ impl AuthResumeCommand {
                 return Err(anyhow!("Authorization response is missing state"));
             }
             Err(Oauth20AuthParamsValidationError::StateMismatch) => {
-                let req = self.state.as_ref().map(|state| state.expose());
-                return Err(
-                    anyhow!("Request state {req:?} does not match response state")
-                        .context("Authorization request and response states do not match"),
-                );
+                // CSRF state must stay off error output.
+                return Err(anyhow!(
+                    "Authorization request and response states do not match"
+                ));
             }
         };
 
@@ -165,10 +178,38 @@ pub fn state_parser(state: &str) -> Result<Oauth20State, String> {
 }
 
 pub fn pkce_code_verifier_parser(verifier: &str) -> Result<Oauth20PkceCodeVerifier, String> {
+    // Omit the verifier body: clap surfaces this string on stderr.
     verifier
         .parse()
-        .map_err(|b| format!("Invalid 0x{b:x} found in PKCE code verifier: {verifier}"))
+        .map_err(|b| format!("Invalid 0x{b:x} found in PKCE code verifier"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkce_code_verifier_parser_error_omits_verifier_body() {
+        let secret = "pkce-secret-value-with space";
+        let err = pkce_code_verifier_parser(secret).unwrap_err();
+        assert!(!err.contains(secret), "{err}");
+        assert!(err.contains("Invalid 0x"), "{err}");
+    }
+
+    #[test]
+    fn auth_resume_debug_redacts_positional_input() {
+        let cmd = AuthResumeCommand {
+            input: "device-code-super-secret".into(),
+            state: None,
+            pkce: None,
+            redirect_uri: None,
+        };
+        let rendered = format!("{cmd:?}");
+        assert!(!rendered.contains("device-code-super-secret"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

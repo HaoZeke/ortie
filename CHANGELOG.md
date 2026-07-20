@@ -23,6 +23,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   endpoints, `outlook.office.com` scopes (not `office365`), Thunderbird
   public client id, and Entra's omission of `verification_uri_complete`.
 
+### Fixed
+
+- Stopped leaking high-entropy secrets into errors, Debug output, JSON
+  inspect, and printed resume lines.
+
+  `auth resume` no longer echoes the redirected URI, CSRF state, or PKCE
+  verifier body. Resume command Debug redacts the positional input.
+  Printed `auth resume` lines shell-single-quote state, PKCE, and device
+  codes. `token inspect --json` is metadata-only. Hook stdout/stderr is
+  not trace-logged.
+
 ## [2.0.0] - 2026-07-17
 
 ### Added

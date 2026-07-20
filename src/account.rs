@@ -552,18 +552,13 @@ fn execute_command_hook(cmd: &mut Command) -> Result<()> {
 
     log::debug!("successfully executed command hook");
 
+    // Never log hook stdout/stderr bodies: success hooks receive
+    // ACCESS_TOKEN / REFRESH_TOKEN in their environment.
     if log::log_enabled!(log::Level::Trace) {
         if output.status.success() {
-            let out = String::from_utf8_lossy(&output.stdout);
-            log::trace!("command hook stdout: {out}");
+            log::trace!("command hook exited successfully");
         } else {
-            let bytes = if output.stdout.is_empty() {
-                &output.stderr
-            } else {
-                &output.stdout
-            };
-            let err = anyhow!("{}", String::from_utf8_lossy(bytes));
-            log::trace!("command hook stderr: {err}");
+            log::trace!("command hook exited with status {}", output.status);
         }
     }
 

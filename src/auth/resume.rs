@@ -207,6 +207,8 @@ mod tests {
 
     #[test]
     fn authorization_code_input_is_redirected_uri_string() {
+        // After the device-grant String change, authorization-code
+        // accounts still treat the positional as a redirected URI.
         let redirected = "  http://127.0.0.1/cb?code=abc&state=s  ";
         let cmd = AuthResumeCommand {
             input: redirected.into(),
@@ -217,6 +219,31 @@ mod tests {
         let trimmed = cmd.input.trim();
         assert!(!trimmed.is_empty());
         assert!(Url::parse(trimmed).is_ok());
+        assert!(cmd.state.is_none());
+        assert!(cmd.pkce.is_none());
+        assert!(cmd.redirect_uri.is_none());
+    }
+
+    #[test]
+    fn authorization_code_await_redirect_chain_fields() {
+        // Mirrors auth get → AuthResumeCommand after await_redirect.
+        let redirected = "http://127.0.0.1:9/?code=c&state=s";
+        let registered: Url = "http://127.0.0.1:9/".parse().unwrap();
+        let cmd = AuthResumeCommand {
+            input: redirected.into(),
+            state: Some(Oauth20State::default()),
+            pkce: Some(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP01234"
+                    .parse()
+                    .unwrap(),
+            ),
+            redirect_uri: Some(registered.clone()),
+        };
+        assert_eq!(cmd.input, redirected);
+        assert!(cmd.state.is_some());
+        assert!(cmd.pkce.is_some());
+        assert_eq!(cmd.redirect_uri.as_ref(), Some(&registered));
+        assert!(Url::parse(&cmd.input).is_ok());
     }
 
     #[test]

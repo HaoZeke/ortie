@@ -410,6 +410,7 @@ fn auth_resume_invalid_pkce_error_omits_verifier_secret() {
         format!(
             r#"
 [accounts.t]
+default = true
 client-id = "c"
 grant = "authorization-code"
 endpoints.authorization = "http://127.0.0.1/a"
@@ -469,6 +470,7 @@ fn auth_resume_invalid_redirect_error_omits_authorization_code() {
         format!(
             r#"
 [accounts.t]
+default = true
 client-id = "c"
 grant = "authorization-code"
 endpoints.authorization = "http://127.0.0.1/a"

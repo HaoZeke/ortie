@@ -35,7 +35,7 @@ use io_oauth::{
 };
 
 use crate::{
-    account::Account,
+    account::{Account, duration_from_expires_in},
     auth::resume::AuthResumeCommand,
     config::{GrantConfig, PkceConfig},
 };
@@ -382,7 +382,7 @@ pub(crate) fn report_token_issued(
         None => "Access token successfully issued (unknown expiry)".into(),
         Some(exp) => format!(
             "Access token successfully issued (expires in {})",
-            format_duration(Duration::from_secs(exp as u64 + 1))
+            format_duration(duration_from_expires_in(exp))
         ),
     };
     printer.out(Message::new(msg))

@@ -19,7 +19,7 @@ use io_oauth::{
     },
 };
 
-use crate::account::Account;
+use crate::account::{Account, duration_from_expires_in};
 
 /// Refresh the current access token.
 ///
@@ -46,7 +46,7 @@ impl TokenRefreshCommand {
         let msg = match token.expires_in {
             None => format!("{msg} (unknown expiry)"),
             Some(exp) => {
-                let exp = Duration::from_secs(exp as u64 + 1);
+                let exp = duration_from_expires_in(exp);
                 format!("{msg} (expires in {})", format_duration(exp))
             }
         };

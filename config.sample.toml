@@ -49,6 +49,31 @@ endpoints.token = ""
 # match a redirect URI registered with the provider (e.g. `http://localhost`).
 #endpoints.redirection = "http://localhost"
 
+# --- Device grant example (RFC 8628 / Microsoft Entra) --------------------
+#
+# Headless hosts use grant = "device". Entra v2.0 only (legacy
+# /oauth2/devicecode returns non-RFC verification_url):
+#
+#   Tenant: common (work+personal), organizations (work only),
+#   consumers (personal only), or a directory id.
+#
+#   [accounts.ms-device]
+#   grant = "device"
+#   client-id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"  # Thunderbird public app
+#   endpoints.device-authorization = "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
+#   endpoints.token = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+#   scopes = [
+#     "https://outlook.office.com/IMAP.AccessAsUser.All",
+#     "https://outlook.office.com/SMTP.Send",
+#     "offline_access",
+#   ]
+#   storage.read.command = ["pass", "show", "ortie/ms-device"]
+#   storage.write.command = "pass insert -m -f ortie/ms-device"
+#
+# Scopes must use https://outlook.office.com/ (not outlook.office365.com).
+# Entra omits verification_uri_complete; auth get uses verification_uri.
+# Non-interactive: ortie -a ms-device auth resume <DEVICE_CODE>.
+
 # OAuth 2.0 scopes granted to the access token.
 scopes = []
 

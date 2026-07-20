@@ -121,3 +121,281 @@ storage.write.command = ["tee", "{t}"]
     let stored: Value = serde_json::from_str(&std::fs::read_to_string(&token).unwrap()).unwrap();
     assert_eq!(stored["access_token"], "at-test");
 }
+
+/// Device and token endpoints may use different hosts/ports. Connect must
+/// open each URL separately (device request vs token poll).
+#[test]
+fn separate_device_and_token_hosts() {
+    let (device_addr, device_polls, _dh) = start_mock();
+    let (token_addr, token_polls, _th) = start_mock();
+    assert_ne!(device_addr, token_addr);
+
+    let dir = TempDir::new().unwrap();
+    let token = dir.path().join("token.json");
+    std::fs::write(&token, b"").unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[accounts.device]
+default = true
+client-id = "c"
+grant = "device"
+endpoints.device-authorization = "http://{device_addr}/devicecode"
+endpoints.token = "http://{token_addr}/token"
+storage.read.command = ["cat", "{t}"]
+storage.write.command = ["tee", "{t}"]
+"#,
+            t = token.display()
+        ),
+    )
+    .unwrap();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ortie"));
+
+    let get = Command::new(&bin)
+        .args(["-c", config.to_str().unwrap(), "--json", "auth", "get"])
+        .output()
+        .unwrap();
+    assert!(get.status.success(), "{get:?}");
+    assert_eq!(
+        token_polls.load(Ordering::SeqCst),
+        0,
+        "token host must not be contacted on auth get --json"
+    );
+    assert_eq!(
+        device_polls.load(Ordering::SeqCst),
+        0,
+        "device host /devicecode is not a token poll"
+    );
+
+    let resume = Command::new(&bin)
+        .args(["-c", config.to_str().unwrap(), "auth", "resume", "dc-test"])
+        .output()
+        .unwrap();
+    assert!(resume.status.success(), "{resume:?}");
+    assert!(
+        token_polls.load(Ordering::SeqCst) >= 1,
+        "token polls must hit the token host"
+    );
+    assert_eq!(
+        device_polls.load(Ordering::SeqCst),
+        0,
+        "device host must not receive token polls"
+    );
+    let stored: Value = serde_json::from_str(&std::fs::read_to_string(&token).unwrap()).unwrap();
+    assert_eq!(stored["access_token"], "at-test");
+}
+
+#[test]
+fn auth_resume_authorization_code_input_still_exchanges_code() {
+    // After device-grant String input, authorization-code accounts still
+    // treat the positional as the redirected URI (trimmed).
+    let (addr, polls, _h) = start_mock();
+    let dir = TempDir::new().unwrap();
+    let token = dir.path().join("token.json");
+    std::fs::write(&token, b"").unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[accounts.ac]
+default = true
+client-id = "c"
+grant = "authorization-code"
+pkce = false
+endpoints.authorization = "http://{addr}/authorize"
+endpoints.token = "http://{addr}/token"
+endpoints.redirection = "http://127.0.0.1/cb"
+storage.read.command = ["cat", "{t}"]
+storage.write.command = ["tee", "{t}"]
+"#,
+            t = token.display()
+        ),
+    )
+    .unwrap();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ortie"));
+
+    // Force first token poll to succeed: authorization-code is one POST.
+    polls.store(1, Ordering::SeqCst);
+
+    let redirected = "  http://127.0.0.1/cb?code=auth-code-xyz&state=mystate  ";
+    let resume = Command::new(&bin)
+        .args([
+            "-c",
+            config.to_str().unwrap(),
+            "auth",
+            "resume",
+            "--state",
+            "mystate",
+            redirected,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        resume.status.success(),
+        "auth resume (authorization-code) failed: {:?}",
+        resume
+    );
+    let stored: Value = serde_json::from_str(&std::fs::read_to_string(&token).unwrap()).unwrap();
+    assert_eq!(stored["access_token"], "at-test");
+}
+
+#[test]
+fn auth_resume_authorization_code_state_mismatch_fails() {
+    let (addr, polls, _h) = start_mock();
+    let dir = TempDir::new().unwrap();
+    let token = dir.path().join("token.json");
+    std::fs::write(&token, b"").unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[accounts.ac]
+default = true
+client-id = "c"
+grant = "authorization-code"
+pkce = false
+endpoints.authorization = "http://{addr}/authorize"
+endpoints.token = "http://{addr}/token"
+endpoints.redirection = "http://127.0.0.1/cb"
+storage.read.command = ["cat", "{t}"]
+storage.write.command = ["tee", "{t}"]
+"#,
+            t = token.display()
+        ),
+    )
+    .unwrap();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ortie"));
+
+    let resume = Command::new(&bin)
+        .args([
+            "-c",
+            config.to_str().unwrap(),
+            "auth",
+            "resume",
+            "--state",
+            "from-client",
+            "http://127.0.0.1/cb?code=x&state=from-server",
+        ])
+        .output()
+        .unwrap();
+    assert!(!resume.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&resume.stdout),
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    assert!(
+        combined.contains("do not match") || combined.contains("state"),
+        "{combined}"
+    );
+    assert!(
+        !combined.contains("from-server") && !combined.contains("from-client"),
+        "state values must not appear in error output: {combined}"
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn auth_get_json_authorization_code_emits_uri_state_and_extras() {
+    let (addr, polls, _h) = start_mock();
+    let dir = TempDir::new().unwrap();
+    let token = dir.path().join("token.json");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[accounts.ac]
+default = true
+client-id = "c"
+grant = "authorization-code"
+pkce = false
+endpoints.authorization = "http://{addr}/authorize"
+endpoints.token = "http://{addr}/token"
+endpoints.redirection = "http://127.0.0.1/cb"
+extras.access_type = "offline"
+extras.prompt = "consent"
+storage.read.command = ["cat", "{t}"]
+storage.write.command = ["tee", "{t}"]
+"#,
+            t = token.display()
+        ),
+    )
+    .unwrap();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ortie"));
+
+    let get = Command::new(&bin)
+        .args(["-c", config.to_str().unwrap(), "--json", "auth", "get"])
+        .output()
+        .unwrap();
+    assert!(get.status.success(), "{get:?}");
+    let v: Value = serde_json::from_slice(&get.stdout).unwrap();
+    let auth_uri = v["authorization_uri"].as_str().unwrap();
+    assert!(auth_uri.contains("/authorize"), "{auth_uri}");
+    assert!(
+        auth_uri.contains("access_type=offline") && auth_uri.contains("prompt=consent"),
+        "extras missing from authorization URI: {auth_uri}"
+    );
+    assert!(
+        v["state"].as_str().is_some_and(|s| !s.is_empty()),
+        "state missing: {v}"
+    );
+    assert!(v["pkce_code_verifier"].is_null(), "{v}");
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert!(!token.exists());
+}
+
+#[test]
+fn auth_resume_authorization_code_with_pkce_sends_verifier() {
+    // Smoke: --pkce is accepted on authorization-code resume and the
+    // token exchange runs (mock does not validate the verifier).
+    let (addr, polls, _h) = start_mock();
+    let dir = TempDir::new().unwrap();
+    let token = dir.path().join("token.json");
+    std::fs::write(&token, b"").unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[accounts.ac]
+default = true
+client-id = "c"
+grant = "authorization-code"
+pkce = true
+endpoints.authorization = "http://{addr}/authorize"
+endpoints.token = "http://{addr}/token"
+endpoints.redirection = "http://127.0.0.1/cb"
+storage.read.command = ["cat", "{t}"]
+storage.write.command = ["tee", "{t}"]
+"#,
+            t = token.display()
+        ),
+    )
+    .unwrap();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ortie"));
+    polls.store(1, Ordering::SeqCst);
+
+    let verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP01234";
+    let resume = Command::new(&bin)
+        .args([
+            "-c",
+            config.to_str().unwrap(),
+            "auth",
+            "resume",
+            "--state",
+            "s1",
+            "--pkce",
+            verifier,
+            "http://127.0.0.1/cb?code=pkce-code&state=s1",
+        ])
+        .output()
+        .unwrap();
+    assert!(resume.status.success(), "{resume:?}");
+    let stored: Value = serde_json::from_str(&std::fs::read_to_string(&token).unwrap()).unwrap();
+    assert_eq!(stored["access_token"], "at-test");
+}

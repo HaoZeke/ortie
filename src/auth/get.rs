@@ -478,3 +478,33 @@ mod tests {
         assert!(!text.contains("entra-device-secret"), "{text}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_redirect_detects_localhost_only() {
+        assert!(is_loopback_redirect(
+            &"http://127.0.0.1:8080/callback".parse().unwrap()
+        ));
+        assert!(is_loopback_redirect(
+            &"http://localhost/callback".parse().unwrap()
+        ));
+        assert!(is_loopback_redirect(
+            &"http://[::1]:8080/callback".parse().unwrap()
+        ));
+        assert!(is_loopback_redirect(
+            &"https://127.0.0.1/callback".parse().unwrap()
+        ));
+        assert!(!is_loopback_redirect(
+            &"org.pimalaya.ortie://redirect".parse().unwrap()
+        ));
+        assert!(!is_loopback_redirect(
+            &"https://example.com/callback".parse().unwrap()
+        ));
+        assert!(!is_loopback_redirect(
+            &"http://192.168.1.1/callback".parse().unwrap()
+        ));
+    }
+}

@@ -23,10 +23,14 @@ use serde::{
 use url::{Host, Url};
 
 use io_oauth::{
-    client::{Oauth20ClientStd, await_redirect},
+    client::{Oauth20ClientStd, Oauth20ClientStdError, await_redirect},
     rfc6749::{
         auth_request::Oauth20AuthRequestParams,
-        issue_access_token::Oauth20AccessTokenSuccessParams, state::Oauth20State,
+        issue_access_token::{
+            Oauth20AccessTokenErrorCode, Oauth20AccessTokenErrorParams,
+            Oauth20AccessTokenSuccessParams,
+        },
+        state::Oauth20State,
     },
     rfc7636::pkce::{
         Oauth20PkceCodeChallenge, Oauth20PkceCodeChallengeMethod, Oauth20PkceCodeVerifier,
@@ -351,9 +355,14 @@ pub(crate) fn complete_device_token_poll(
     )?;
     client.client_secret = client_secret;
 
-    match client.await_device_access_token(&account.tls, device)? {
-        Ok(res) => report_token_issued(printer, account, &res),
-        Err(res) => {
+    // Outer Result: transport / client-side; inner Result: token endpoint
+    // OAuth body. Terminal issuance outcomes fire on-issue hooks (server
+    // OAuth errors + client DeviceCodeExpired). Network failures do not,
+    // matching authorization-code token exchange.
+    match client.await_device_access_token(&account.tls, device) {
+        Ok(Ok(res)) => report_token_issued(printer, account, &res),
+        Ok(Err(res)) => {
+            debug!("execute issue access token error hook");
             account.execute_on_issue_error_hook(&res);
             let err = anyhow!("Issue access token error (code {:?})", res.error);
             Err(match (res.error_description, res.error_uri) {
@@ -363,6 +372,31 @@ pub(crate) fn complete_device_token_poll(
                 (Some(desc), Some(uri)) => anyhow!("{desc}: {uri}").context(err),
             })
         }
+        Err(err) => {
+            if let Some(params) = device_poll_client_error_hook_params(&err) {
+                debug!("execute issue access token error hook");
+                account.execute_on_issue_error_hook(&params);
+            }
+            Err(err.into())
+        }
+    }
+}
+
+/// Client DeviceCodeExpired is the local deadline twin of server
+/// `expired_token` (RFC 8628 §3.5); synthesize hook params so on-issue
+/// error hooks fire consistently for both.
+pub(crate) fn device_poll_client_error_hook_params(
+    err: &Oauth20ClientStdError,
+) -> Option<Oauth20AccessTokenErrorParams> {
+    match err {
+        Oauth20ClientStdError::DeviceCodeExpired => Some(Oauth20AccessTokenErrorParams {
+            error: Oauth20AccessTokenErrorCode::ExpiredToken,
+            error_description: Some(
+                "device code expired before the user completed authorization".into(),
+            ),
+            error_uri: None,
+        }),
+        _ => None,
     }
 }
 
@@ -414,5 +448,30 @@ impl fmt::Display for DeviceAuthorization {
             "Navigate to {} and enter the code {}",
             self.verification_uri, self.user_code
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_code_expired_maps_to_expired_token_hook_params() {
+        let params = device_poll_client_error_hook_params(&Oauth20ClientStdError::DeviceCodeExpired)
+            .expect("DeviceCodeExpired must fire the on-issue error hook");
+        assert_eq!(params.error, Oauth20AccessTokenErrorCode::ExpiredToken);
+        assert!(
+            params
+                .error_description
+                .as_deref()
+                .is_some_and(|d| d.contains("expired"))
+        );
+        assert!(params.error_uri.is_none());
+    }
+
+    #[test]
+    fn network_style_client_errors_do_not_synthesize_hook_params() {
+        let io_err = Oauth20ClientStdError::Io(std::io::Error::other("connection reset"));
+        assert!(device_poll_client_error_hook_params(&io_err).is_none());
     }
 }

@@ -7,15 +7,19 @@
 //! (`read_from_storage`, `write_to_storage`,
 //! `execute_on_{issue,refresh}_{success,error}_hook`,
 //! `redirection`) instead of walking the original config tree.
+//!
+//! Storage and hook commands are immutable templates: each invocation
+//! clones program/args/env into a fresh [`Command`] so stdio and env
+//! mutations never race with or accumulate on fields stored in
+//! [`Account`].
 
-#[cfg(feature = "notify")]
-use std::time::Duration;
 use std::{
     borrow::Cow,
     collections::HashMap,
     io::Write,
     net::TcpListener,
     process::{Command, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -30,7 +34,7 @@ use secrecy::ExposeSecret;
 use url::Url;
 
 use io_oauth::rfc6749::issue_access_token::{
-    Oauth20AccessTokenErrorParams, Oauth20AccessTokenSuccessParams,
+    Oauth20AccessTokenErrorCode, Oauth20AccessTokenErrorParams, Oauth20AccessTokenSuccessParams,
 };
 
 use crate::config::{
@@ -209,8 +213,8 @@ impl Account {
 
     /// Reads the persisted token by running the read storage command
     /// and parsing its stdout as the token response JSON.
-    pub fn read_from_storage(&mut self) -> Result<Oauth20AccessTokenSuccessParams> {
-        let cmd = &mut self.read_storage_command;
+    pub fn read_from_storage(&self) -> Result<Oauth20AccessTokenSuccessParams> {
+        let mut cmd = clone_command(&self.read_storage_command);
 
         let output = cmd
             .output()
@@ -234,26 +238,40 @@ impl Account {
 
     /// Persists the token by running the write storage command and
     /// piping the token response JSON to its stdin.
-    pub fn write_to_storage(&mut self, res: &Oauth20AccessTokenSuccessParams) -> Result<()> {
-        let cmd = &mut self.write_storage_command;
-        let json = String::try_from(res)?.into_bytes();
+    ///
+    /// On failure the issued token JSON is attached to the error so the
+    /// operator can recover it: device codes and auth codes are typically
+    /// single-use, so a successful token response followed by a failed
+    /// storage write would otherwise discard the only copy of the secret.
+    pub fn write_to_storage(&self, res: &Oauth20AccessTokenSuccessParams) -> Result<()> {
+        let mut cmd = clone_command(&self.write_storage_command);
+        let json = String::try_from(res)?;
 
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("Spawn command to save OAuth 2.0 access token")?;
+            .context("Spawn command to save OAuth 2.0 access token")
+            .map_err(|err| with_token_recovery(err, &json))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(&json)
-                .context("Write access token to command stdin")?;
-        }
+        // Missing stdin after a piped spawn would hang wait_with_output.
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Write access token: child stdin pipe missing"))
+            .map_err(|err| with_token_recovery(err, &json))?;
+        stdin
+            .write_all(json.as_bytes())
+            .context("Write access token to command stdin")
+            .map_err(|err| with_token_recovery(err, &json))?;
+        // Explicit drop sends EOF so the storage command can finish.
+        drop(stdin);
 
         let output = child
             .wait_with_output()
-            .context("Wait for save command to finish")?;
+            .context("Wait for save command to finish")
+            .map_err(|err| with_token_recovery(err, &json))?;
 
         if !output.status.success() {
             let err = "Write access token via command error";
@@ -264,80 +282,109 @@ impl Account {
                 output.stdout
             };
 
-            if data.is_empty() {
-                bail!(err);
-            }
-
-            let err2 = anyhow!("{}", String::from_utf8_lossy(&data));
-            return Err(err2.context(err));
+            let write_err = if data.is_empty() {
+                anyhow!(err)
+            } else {
+                anyhow!("{}", String::from_utf8_lossy(&data)).context(err)
+            };
+            return Err(with_token_recovery(write_err, &json));
         }
 
         Ok(())
     }
 
     /// Fires the on-issue success hook with the issued token.
-    pub fn execute_on_issue_success_hook(&mut self, res: &Oauth20AccessTokenSuccessParams) {
+    pub fn execute_on_issue_success_hook(&self, res: &Oauth20AccessTokenSuccessParams) {
         #[cfg(feature = "notify")]
         let notify = self.on_issue_success_hook_notify.as_ref();
         #[cfg(not(feature = "notify"))]
         let notify = None;
-        execute_success_hook(self.on_issue_success_hook_command.as_mut(), notify, res);
+        execute_success_hook(self.on_issue_success_hook_command.as_ref(), notify, res);
     }
 
     /// Fires the on-issue error hook with the server error.
-    pub fn execute_on_issue_error_hook(&mut self, res: &Oauth20AccessTokenErrorParams) {
+    pub fn execute_on_issue_error_hook(&self, res: &Oauth20AccessTokenErrorParams) {
         #[cfg(feature = "notify")]
         let notify = self.on_issue_error_hook_notify.as_ref();
         #[cfg(not(feature = "notify"))]
         let notify = None;
-        execute_error_hook(self.on_issue_error_hook_command.as_mut(), notify, res);
+        execute_error_hook(self.on_issue_error_hook_command.as_ref(), notify, res);
     }
 
     /// Fires the on-refresh success hook with the refreshed token.
-    pub fn execute_on_refresh_success_hook(&mut self, res: &Oauth20AccessTokenSuccessParams) {
+    pub fn execute_on_refresh_success_hook(&self, res: &Oauth20AccessTokenSuccessParams) {
         #[cfg(feature = "notify")]
         let notify = self.on_refresh_success_hook_notify.as_ref();
         #[cfg(not(feature = "notify"))]
         let notify = None;
-        execute_success_hook(self.on_refresh_success_hook_command.as_mut(), notify, res);
+        execute_success_hook(self.on_refresh_success_hook_command.as_ref(), notify, res);
     }
 
     /// Fires the on-refresh error hook with the server error.
-    pub fn execute_on_refresh_error_hook(&mut self, res: &Oauth20AccessTokenErrorParams) {
+    pub fn execute_on_refresh_error_hook(&self, res: &Oauth20AccessTokenErrorParams) {
         #[cfg(feature = "notify")]
         let notify = self.on_refresh_error_hook_notify.as_ref();
         #[cfg(not(feature = "notify"))]
         let notify = None;
-        execute_error_hook(self.on_refresh_error_hook_command.as_mut(), notify, res);
+        execute_error_hook(self.on_refresh_error_hook_command.as_ref(), notify, res);
     }
+}
+
+/// `Account` is `Send` so it can move into a worker that runs storage
+/// or hooks. It is deliberately not `Sync`: `Command` is not `Sync`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Account>();
+};
+
+/// Clones program, args, cwd, and env from `cmd` into a fresh builder.
+///
+/// Stdio configuration is not copied: each caller sets the pipes it
+/// needs on the clone so [`Account`] template fields stay free of
+/// piped-stdio residue between invocations.
+fn clone_command(cmd: &Command) -> Command {
+    let mut new = Command::new(cmd.get_program());
+    new.args(cmd.get_args());
+    if let Some(dir) = cmd.get_current_dir() {
+        new.current_dir(dir);
+    }
+    for (key, val) in cmd.get_envs() {
+        match val {
+            Some(v) => {
+                new.env(key, v);
+            }
+            None => {
+                new.env_remove(key);
+            }
+        }
+    }
+    new
+}
+
+/// Converts an OAuth `expires_in` lifetime into a [`Duration`] for
+/// human display.
+///
+/// Adds one second so values like 3599s render as a round hour. Uses
+/// saturating arithmetic so `usize::MAX` cannot panic on `as u64 + 1`
+/// in debug builds.
+pub(crate) fn duration_from_expires_in(expires_in: usize) -> Duration {
+    Duration::from_secs((expires_in as u64).saturating_add(1))
 }
 
 /// Runs a success hook: the command with the token exposed as
 /// environment variables, then the notification.
 fn execute_success_hook(
-    cmd: Option<&mut Command>,
+    cmd: Option<&Command>,
     #[cfg_attr(not(feature = "notify"), allow(unused))] notify: Option<&NotifyConfig>,
     res: &Oauth20AccessTokenSuccessParams,
 ) {
     trace!("execute success hook: {res:?}");
 
-    if let Some(cmd) = cmd {
-        cmd.env("ACCESS_TOKEN", res.access_token.expose_secret());
-        cmd.env("TOKEN_TYPE", &res.token_type);
+    if let Some(template) = cmd {
+        let mut cmd = clone_command(template);
+        apply_success_hook_env(&mut cmd, res);
 
-        if let Some(exp) = res.expires_in {
-            cmd.env("EXPIRES_IN", exp.to_string());
-        }
-
-        if let Some(token) = &res.refresh_token {
-            cmd.env("REFRESH_TOKEN", token.expose_secret());
-        }
-
-        if let Some(scope) = &res.scope {
-            cmd.env("SCOPE", scope);
-        }
-
-        if let Err(err) = execute_command_hook(cmd) {
+        if let Err(err) = execute_command_hook(&mut cmd) {
             log::debug!("execute command hook error: {err}");
         }
     }
@@ -345,25 +392,7 @@ fn execute_success_hook(
     #[cfg(feature = "notify")]
     if let Some(config) = notify {
         let get_env = |key: &str| -> Result<Option<Cow<str>>, ()> {
-            if key == "EXPIRES_IN" {
-                return match res.expires_in {
-                    None => Ok(Some("unknown".into())),
-                    Some(exp) => {
-                        let exp = Duration::from_secs(exp as u64 + 1);
-                        Ok(Some(format_duration(exp).to_string().into()))
-                    }
-                };
-            }
-
-            if key == "TOKEN_TYPE" {
-                let t = (&res.token_type).into();
-                return Ok(Some(t));
-            }
-
-            match std::env::var(key) {
-                Ok(val) => Ok(Some(val.into())),
-                Err(_) => Ok(None),
-            }
+            Ok(success_hook_env_value(key, res))
         };
 
         notify_with(config, get_env);
@@ -373,24 +402,17 @@ fn execute_success_hook(
 /// Runs an error hook: the command with the server error exposed as
 /// environment variables, then the notification.
 fn execute_error_hook(
-    cmd: Option<&mut Command>,
+    cmd: Option<&Command>,
     #[cfg_attr(not(feature = "notify"), allow(unused))] notify: Option<&NotifyConfig>,
     res: &Oauth20AccessTokenErrorParams,
 ) {
     trace!("execute error hook: {res:?}");
 
-    if let Some(cmd) = cmd {
-        cmd.env("ERROR", format!("{:?}", res.error));
+    if let Some(template) = cmd {
+        let mut cmd = clone_command(template);
+        apply_error_hook_env(&mut cmd, res);
 
-        if let Some(desc) = &res.error_description {
-            cmd.env("ERROR_DESCRIPTION", desc);
-        }
-
-        if let Some(uri) = &res.error_uri {
-            cmd.env("ERROR_URI", uri);
-        }
-
-        if let Err(err) = execute_command_hook(cmd) {
+        if let Err(err) = execute_command_hook(&mut cmd) {
             log::debug!("execute command hook error: {err}");
         }
     }
@@ -398,26 +420,128 @@ fn execute_error_hook(
     #[cfg(feature = "notify")]
     if let Some(config) = notify {
         let get_env = |key: &str| -> Result<Option<Cow<str>>, ()> {
-            if key == "ERROR" {
-                return Ok(Some(format!("{:?}", res.error).into()));
-            }
-
-            if key == "ERROR_DESCRIPTION" {
-                return Ok(res.error_description.as_ref().map(Into::into));
-            }
-
-            if key == "ERROR_URI" {
-                return Ok(res.error_uri.as_ref().map(Into::into));
-            }
-
-            match std::env::var(key) {
-                Ok(val) => Ok(Some(val.into())),
-                Err(_) => Ok(None),
-            }
+            Ok(error_hook_env_value(key, res))
         };
 
         notify_with(config, get_env);
     }
+}
+
+/// Sets success-hook environment variables on a cloned command from the
+/// issued token. Shell-form and exec-array commands both inherit these
+/// values; shell form is only required when the command line expands `$VAR`.
+fn apply_success_hook_env(cmd: &mut Command, res: &Oauth20AccessTokenSuccessParams) {
+    cmd.env("ACCESS_TOKEN", res.access_token.expose_secret());
+    cmd.env("TOKEN_TYPE", &res.token_type);
+
+    if let Some(exp) = res.expires_in {
+        cmd.env("EXPIRES_IN", exp.to_string());
+    }
+
+    if let Some(token) = &res.refresh_token {
+        cmd.env("REFRESH_TOKEN", token.expose_secret());
+    }
+
+    if let Some(scope) = &res.scope {
+        cmd.env("SCOPE", scope);
+    }
+}
+
+/// Sets error-hook environment variables using OAuth wire-form error codes.
+fn apply_error_hook_env(cmd: &mut Command, res: &Oauth20AccessTokenErrorParams) {
+    cmd.env("ERROR", access_token_error_code_wire(&res.error));
+
+    if let Some(desc) = &res.error_description {
+        cmd.env("ERROR_DESCRIPTION", desc);
+    }
+
+    if let Some(uri) = &res.error_uri {
+        cmd.env("ERROR_URI", uri);
+    }
+}
+
+/// Resolves a success-hook variable for notify expansion from the token,
+/// never from the ambient process environment.
+#[cfg_attr(not(any(test, feature = "notify")), allow(dead_code))]
+fn success_hook_env_value<'a>(
+    key: &str,
+    res: &'a Oauth20AccessTokenSuccessParams,
+) -> Option<Cow<'a, str>> {
+    match key {
+        "ACCESS_TOKEN" => Some(res.access_token.expose_secret().into()),
+        "TOKEN_TYPE" => Some((&res.token_type).into()),
+        "EXPIRES_IN" => match res.expires_in {
+            None => Some("unknown".into()),
+            Some(exp) => {
+                #[cfg(feature = "notify")]
+                {
+                    let exp = duration_from_expires_in(exp);
+                    Some(format_duration(exp).to_string().into())
+                }
+                #[cfg(not(feature = "notify"))]
+                {
+                    Some(exp.to_string().into())
+                }
+            }
+        },
+        "REFRESH_TOKEN" => res
+            .refresh_token
+            .as_ref()
+            .map(|t| Cow::from(t.expose_secret())),
+        "SCOPE" => res.scope.as_deref().map(Cow::from),
+        _ => match std::env::var(key) {
+            Ok(val) => Some(val.into()),
+            Err(_) => None,
+        },
+    }
+}
+
+/// Resolves an error-hook variable for notify expansion from the server error.
+#[cfg_attr(not(any(test, feature = "notify")), allow(dead_code))]
+fn error_hook_env_value<'a>(
+    key: &str,
+    res: &'a Oauth20AccessTokenErrorParams,
+) -> Option<Cow<'a, str>> {
+    match key {
+        "ERROR" => Some(access_token_error_code_wire(&res.error).into()),
+        "ERROR_DESCRIPTION" => res.error_description.as_deref().map(Cow::from),
+        "ERROR_URI" => res.error_uri.as_deref().map(Cow::from),
+        _ => match std::env::var(key) {
+            Ok(val) => Some(val.into()),
+            Err(_) => None,
+        },
+    }
+}
+
+/// OAuth wire-form error code (snake_case), matching the token endpoint
+/// JSON `error` member rather than the Rust Debug name.
+fn access_token_error_code_wire(code: &Oauth20AccessTokenErrorCode) -> &'static str {
+    use Oauth20AccessTokenErrorCode::*;
+    match code {
+        InvalidClient => "invalid_client",
+        InvalidGrant => "invalid_grant",
+        InvalidRequest => "invalid_request",
+        InvalidScope => "invalid_scope",
+        UnauthorizedClient => "unauthorized_client",
+        UnsupportedGrantType => "unsupported_grant_type",
+        AuthorizationPending => "authorization_pending",
+        SlowDown => "slow_down",
+        AccessDenied => "access_denied",
+        ExpiredToken => "expired_token",
+        AuthorizationDeclined => "authorization_declined",
+        BadVerificationCode => "bad_verification_code",
+        InvalidTarget => "invalid_target",
+        Unknown => "unknown",
+    }
+}
+
+/// Attaches the issued token JSON to a storage-write error so a failed
+/// save after a successful issue remains recoverable.
+fn with_token_recovery(err: anyhow::Error, json: &str) -> anyhow::Error {
+    err.context(format!(
+        "Access token was issued but storage write failed; recover from this JSON:
+{json}"
+    ))
 }
 
 /// Spawns a hook command, logging (never failing on) its outcome.
@@ -465,5 +589,330 @@ where
 
     if let Err(err) = notif {
         log::debug!("execute notify hook error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use secrecy::SecretString;
+
+    use super::*;
+    use crate::config::Config;
+
+    fn account_from_toml(toml: &str) -> Account {
+        let cfg: Config = toml::from_str(toml).expect("parse config");
+        let (_, account_cfg) = cfg.accounts.into_iter().next().expect("one account");
+        Account::from(account_cfg)
+    }
+
+    #[test]
+    fn duration_from_expires_in_saturates_on_max() {
+        let d = duration_from_expires_in(usize::MAX);
+        assert_eq!(d, Duration::from_secs(u64::MAX));
+        assert_eq!(duration_from_expires_in(3599), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn clone_command_copies_program_args_and_env() {
+        let mut template = Command::new("echo");
+        template.arg("hi").env("ORTIE_TEST_CLONE", "1");
+        template.stdin(Stdio::null());
+
+        let clone = clone_command(&template);
+        assert_eq!(clone.get_program(), template.get_program());
+        assert_eq!(
+            clone.get_args().collect::<Vec<_>>(),
+            template.get_args().collect::<Vec<_>>()
+        );
+        let env: Vec<_> = clone
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+            .collect();
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "ORTIE_TEST_CLONE" && v == "1"),
+            "env must copy: {env:?}"
+        );
+    }
+
+    #[test]
+    fn hook_fire_does_not_mutate_account_command_env() {
+        let account = account_from_toml(
+            r#"
+            [accounts.a]
+            client-id = "client"
+            endpoints.token = "http://127.0.0.1:9/token"
+            storage.read.command = ["true"]
+            storage.write.command = ["true"]
+            hooks.on-issue.success.command = ["true"]
+            "#,
+        );
+        let before: Vec<_> = account
+            .on_issue_success_hook_command
+            .as_ref()
+            .expect("hook")
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+            .collect();
+
+        let res = Oauth20AccessTokenSuccessParams {
+            access_token: SecretString::from("tok"),
+            token_type: "Bearer".into(),
+            expires_in: Some(60),
+            refresh_token: None,
+            scope: Some("mail".into()),
+            issued_at: None,
+        };
+        account.execute_on_issue_success_hook(&res);
+
+        let after: Vec<_> = account
+            .on_issue_success_hook_command
+            .as_ref()
+            .expect("hook")
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+            .collect();
+        assert_eq!(before, after, "template Command env must stay clean");
+    }
+
+    #[test]
+    fn write_then_read_array_and_shell_roundtrip_special_chars() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let special = Oauth20AccessTokenSuccessParams {
+            access_token: SecretString::from("tok\"$`\n\t'end"),
+            token_type: "Bearer".into(),
+            expires_in: Some(90),
+            refresh_token: Some(SecretString::from("ref;echo pwned")),
+            scope: Some("a b \"quoted\"".into()),
+            issued_at: None,
+        };
+
+        let array_path = dir.path().join("array.json");
+        let array_toml = format!(
+            r#"
+            [accounts.a]
+            client-id = "client"
+            endpoints.token = "http://127.0.0.1:9/token"
+            storage.read.command = ["cat", {p}]
+            storage.write.command = ["tee", {p}]
+            "#,
+            p = toml_quote(&array_path.display().to_string()),
+        );
+        let account = account_from_toml(&array_toml);
+        account.write_to_storage(&special).expect("array write");
+        let got = account.read_from_storage().expect("array read");
+        assert_eq!(
+            got.access_token.expose_secret(),
+            special.access_token.expose_secret()
+        );
+
+        let shell_path = dir.path().join("tok en;file.json");
+        let quoted = shell_single_quote(&shell_path.display().to_string());
+        let shell_toml = format!(
+            r#"
+            [accounts.a]
+            client-id = "client"
+            endpoints.token = "http://127.0.0.1:9/token"
+            storage.read.command = "cat {q}"
+            storage.write.command = "cat > {q}"
+            "#,
+            q = quoted,
+        );
+        let account = account_from_toml(&shell_toml);
+        account.write_to_storage(&special).expect("shell write");
+        let got = account.read_from_storage().expect("shell read");
+        assert_eq!(
+            got.refresh_token
+                .as_ref()
+                .map(|t| t.expose_secret().to_owned()),
+            Some("ref;echo pwned".into())
+        );
+        let raw = fs::read_to_string(&shell_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["access_token"], special.access_token.expose_secret());
+    }
+
+    #[test]
+    fn write_failure_includes_token_json_for_recovery() {
+        let account = account_from_toml(
+            r#"
+            [accounts.a]
+            client-id = "client"
+            endpoints.token = "http://127.0.0.1:9/token"
+            storage.read.command = ["true"]
+            storage.write.command = "cat >/dev/null; exit 1"
+            "#,
+        );
+        let token = Oauth20AccessTokenSuccessParams {
+            access_token: SecretString::from("must-recover"),
+            token_type: "Bearer".into(),
+            expires_in: Some(1),
+            refresh_token: Some(SecretString::from("rt")),
+            scope: None,
+            issued_at: None,
+        };
+        let err = account.write_to_storage(&token).expect_err("write fails");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("recover") || msg.contains("storage write failed"),
+            "missing recovery: {msg}"
+        );
+        assert!(
+            msg.contains("must-recover"),
+            "token missing from error: {msg}"
+        );
+    }
+
+    #[test]
+    fn on_issue_success_hook_exports_env_shell_form() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let out = dir.path().join("hook.env");
+        let out_q = shell_single_quote(&out.display().to_string());
+        let account = account_from_toml(&format!(
+            r#"
+            [accounts.a]
+            client-id = "client"
+            endpoints.token = "http://127.0.0.1:9/token"
+            storage.read.command = ["true"]
+            storage.write.command = ["true"]
+            hooks.on-issue.success.command = "printf '%s\n' \"$ACCESS_TOKEN\" \"$TOKEN_TYPE\" \"$EXPIRES_IN\" \"$REFRESH_TOKEN\" \"$SCOPE\" > {out_q}"
+            "#,
+        ));
+        let res = Oauth20AccessTokenSuccessParams {
+            access_token: SecretString::from("access-plain"),
+            token_type: "Bearer".into(),
+            expires_in: Some(3600),
+            refresh_token: Some(SecretString::from("refresh-plain")),
+            scope: Some("mail".into()),
+            issued_at: None,
+        };
+        account.execute_on_issue_success_hook(&res);
+        let body = fs::read_to_string(&out).expect("hook wrote env");
+        assert_eq!(
+            body.lines().collect::<Vec<_>>(),
+            ["access-plain", "Bearer", "3600", "refresh-plain", "mail"]
+        );
+    }
+
+    #[test]
+    fn on_issue_error_hook_exports_wire_form_error() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let out = dir.path().join("err.env");
+        let out_q = shell_single_quote(&out.display().to_string());
+        let account = account_from_toml(&format!(
+            r#"
+            [accounts.a]
+            client-id = "client"
+            endpoints.token = "http://127.0.0.1:9/token"
+            storage.read.command = ["true"]
+            storage.write.command = ["true"]
+            hooks.on-issue.error.command = "printf '%s\n' \"$ERROR\" \"$ERROR_DESCRIPTION\" > {out_q}"
+            "#,
+        ));
+        let res = Oauth20AccessTokenErrorParams {
+            error: Oauth20AccessTokenErrorCode::AccessDenied,
+            error_description: Some("user said no".into()),
+            error_uri: None,
+        };
+        account.execute_on_issue_error_hook(&res);
+        let body = fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            body.lines().collect::<Vec<_>>(),
+            ["access_denied", "user said no"]
+        );
+        assert_eq!(
+            access_token_error_code_wire(&Oauth20AccessTokenErrorCode::AuthorizationPending),
+            "authorization_pending"
+        );
+    }
+
+    #[test]
+    fn success_hook_env_value_reads_token_fields() {
+        let res = Oauth20AccessTokenSuccessParams {
+            access_token: SecretString::from("secret-at"),
+            token_type: "Bearer".into(),
+            expires_in: Some(10),
+            refresh_token: Some(SecretString::from("secret-rt")),
+            scope: Some("s".into()),
+            issued_at: None,
+        };
+        assert_eq!(
+            success_hook_env_value("ACCESS_TOKEN", &res)
+                .unwrap()
+                .as_ref(),
+            "secret-at"
+        );
+        assert_eq!(
+            success_hook_env_value("REFRESH_TOKEN", &res)
+                .unwrap()
+                .as_ref(),
+            "secret-rt"
+        );
+        assert_eq!(
+            success_hook_env_value("SCOPE", &res).unwrap().as_ref(),
+            "s"
+        );
+    }
+
+    #[test]
+    fn storage_write_then_success_hook_order() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let token_path = dir.path().join("token.json");
+        let order_path = dir.path().join("order.log");
+        let tq = shell_single_quote(&token_path.display().to_string());
+        let oq = shell_single_quote(&order_path.display().to_string());
+        let account = account_from_toml(&format!(
+            r#"
+            [accounts.a]
+            client-id = "client"
+            endpoints.token = "http://127.0.0.1:9/token"
+            storage.read.command = ["cat", {tp}]
+            storage.write.command = "tee {tq} >/dev/null && printf 'write\n' >> {oq}"
+            hooks.on-issue.success.command = "printf 'hook\n' >> {oq}"
+            "#,
+            tp = toml_quote(&token_path.display().to_string()),
+        ));
+        let res = Oauth20AccessTokenSuccessParams {
+            access_token: SecretString::from("access-plain"),
+            token_type: "Bearer".into(),
+            expires_in: Some(1),
+            refresh_token: None,
+            scope: None,
+            issued_at: None,
+        };
+        account.write_to_storage(&res).expect("write");
+        account.execute_on_issue_success_hook(&res);
+        let order = fs::read_to_string(&order_path).unwrap();
+        assert_eq!(order.lines().collect::<Vec<_>>(), ["write", "hook"]);
+    }
+
+    fn toml_quote(s: &str) -> String {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    fn shell_single_quote(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('\'');
+        for ch in s.chars() {
+            if ch == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+        out
     }
 }

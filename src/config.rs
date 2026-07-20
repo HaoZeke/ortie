@@ -294,3 +294,98 @@ impl From<TlsConfig> for Tls {
 fn tls<'de, D: Deserializer<'de>>(d: D) -> Result<Tls, D::Error> {
     Ok(TlsConfig::deserialize(d)?.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Oauth20ClientStd::connect` uses `Url::port_or_known_default`.
+    #[test]
+    fn endpoint_urls_without_explicit_port_keep_known_defaults() {
+        let toml = r#"
+            [accounts.device]
+            client-id = "client"
+            grant = "device"
+            endpoints.device-authorization = "https://login.example/oauth2/v2.0/devicecode"
+            endpoints.token = "https://login.example/oauth2/v2.0/token"
+            storage.read.command = ["cat", "token.json"]
+            storage.write.command = ["tee", "token.json"]
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let account = cfg.accounts.get("device").expect("account");
+        let device = account.endpoints.device_authorization.as_ref().expect("device");
+        let token = account.endpoints.token.as_ref().expect("token");
+        assert_eq!(device.scheme(), "https");
+        assert_eq!(token.scheme(), "https");
+        assert_eq!(device.port_or_known_default(), Some(443));
+        assert_eq!(token.port_or_known_default(), Some(443));
+    }
+
+    #[test]
+    fn http_endpoints_without_port_default_to_80_and_may_differ_by_host() {
+        let toml = r#"
+            [accounts.device]
+            client-id = "client"
+            grant = "device"
+            endpoints.device-authorization = "http://auth.example/devicecode"
+            endpoints.token = "http://token.example/token"
+            storage.read.command = ["cat", "token.json"]
+            storage.write.command = ["tee", "token.json"]
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let account = cfg.accounts.get("device").expect("account");
+        let device = account.endpoints.device_authorization.as_ref().expect("device");
+        let token = account.endpoints.token.as_ref().expect("token");
+        assert_eq!(device.port_or_known_default(), Some(80));
+        assert_eq!(token.port_or_known_default(), Some(80));
+        assert_ne!(device.host_str(), token.host_str());
+    }
+
+    #[test]
+    fn tls_config_maps_provider_and_rustls_crypto() {
+        for (value, provider_label, crypto_label) in [
+            ("native-tls", "native", None),
+            ("rustls-aws", "rustls", Some("aws")),
+            ("rustls-ring", "rustls", Some("ring")),
+        ] {
+            let toml = format!(
+                r#"
+                [accounts.a]
+                client-id = "client"
+                tls = "{value}"
+                endpoints.token = "https://login.example/token"
+                storage.read.command = ["cat", "token.json"]
+                storage.write.command = ["tee", "token.json"]
+            "#
+            );
+            let cfg: Config = toml::from_str(&toml).expect("parse");
+            let account = cfg.accounts.get("a").expect("account");
+            let got_provider = match &account.tls.provider {
+                Some(TlsProvider::NativeTls) => "native",
+                Some(TlsProvider::Rustls) => "rustls",
+                None => "none",
+            };
+            assert_eq!(got_provider, provider_label, "tls={value}");
+            let got_crypto = account.tls.rustls.crypto.as_ref().map(|c| match c {
+                RustlsCrypto::Aws => "aws",
+                RustlsCrypto::Ring => "ring",
+            });
+            assert_eq!(got_crypto, crypto_label, "tls={value}");
+            assert!(account.tls.provider.is_some(), "tls={value}");
+        }
+    }
+
+    #[test]
+    fn omitted_tls_leaves_provider_none_for_feature_fallback() {
+        let toml = r#"
+            [accounts.a]
+            client-id = "client"
+            endpoints.token = "https://login.example/token"
+            storage.read.command = ["cat", "token.json"]
+            storage.write.command = ["tee", "token.json"]
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let account = cfg.accounts.get("a").expect("account");
+        assert!(account.tls.provider.is_none());
+    }
+}

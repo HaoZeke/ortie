@@ -405,6 +405,7 @@ fn auth_resume_invalid_pkce_error_omits_verifier_secret() {
     let dir = TempDir::new().unwrap();
     let config = dir.path().join("c.toml");
     let token = dir.path().join("t.json");
+    std::fs::write(&token, b"").unwrap();
     std::fs::write(
         &config,
         format!(
@@ -425,10 +426,14 @@ storage.write.command = ["tee", "{t}"]
     .unwrap();
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_ortie"));
     let secret = "pkce-verifier-with space-secret";
+    // PKCE is a plain String at clap (validated in execute) so invalid
+    // bytes never surface as a clap value_parser echo of the secret.
     let out = Command::new(&bin)
         .args([
             "-c",
             config.to_str().unwrap(),
+            "-a",
+            "t",
             "auth",
             "resume",
             "--pkce",
@@ -437,26 +442,19 @@ storage.write.command = ["tee", "{t}"]
         ])
         .output()
         .unwrap();
-    assert!(!out.status.success());
+    assert!(!out.status.success(), "{out:?}");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    // Clap always quotes the invalid CLI value in `invalid value '…' for
-    // '--pkce'`. Our value_parser message after that must not re-echo the
-    // secret (unit test covers the parser string in isolation).
     assert!(
         combined.contains("Invalid 0x") && combined.contains("PKCE code verifier"),
         "{combined}"
     );
-    let parser_msg = combined
-        .split("PKCE code verifier")
-        .nth(1)
-        .unwrap_or("");
     assert!(
-        !parser_msg.contains(secret),
-        "parser message re-echoed verifier: {combined}"
+        !combined.contains(secret),
+        "error output must not re-echo the verifier: {combined}"
     );
 }
 

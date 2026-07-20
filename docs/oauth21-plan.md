@@ -6,7 +6,7 @@ Reference: [draft-ietf-oauth-v2-1-15](https://datatracker.ietf.org/doc/html/draf
 
 ## Where ortie stands
 
-One grant flow (authorization code, optional PKCE, optional client secret), token show/inspect/refresh over external storage commands, issue/refresh hooks, and an auth discover wizard whose output is print-only. io-oauth already ships everything needed for the device grant (RFC 8628) and dynamic client registration (RFC 7591); io-pim-discovery already resolves RFC 8414 issuer metadata and can enable RFC 9728. The gaps are all in ortie's config shape, CLI surface and wiring.
+Two grant flows (`grant = "authorization-code"` default, or `grant = "device"` for RFC 8628), optional client secret, PKCE S256 by default on the authorization-code path, token show/inspect/refresh over external storage commands, issue/refresh hooks, and an auth discover wizard whose output is print-only (including dynamic client registration when the provider advertises it). Remaining gaps are discovery upgrades (M4), release polish (M3), and revocation (M6).
 
 ## Versioning: v2.0.0
 
@@ -20,15 +20,16 @@ Note that the token side (show/inspect/refresh, storage commands, hooks) is alre
 
 | 2.1 requirement | ortie today | action |
 |---|---|---|
-| PKCE (S256) required on every authorization code flow | opt-in, default off | M1 richer pkce config, default flips to S256 |
+| PKCE (S256) required on every authorization code flow | default S256; `pkce = false` / `"plain"` escape hatches (M1) | none |
 | Implicit grant removed | never supported | none |
 | Resource owner password credentials removed | never supported | none |
 | Exact redirect URI matching (loopback port may vary) | compliant; ephemeral 127.0.0.1 port is the permitted loopback exception | M3 doc note only |
 | Refresh token rotation or sender-constraining for public clients | rotation handled; old refresh token kept when server omits a new one | M3 verify failure ordering |
 | No bearer tokens in query strings | never done | none |
 | state optional once PKCE is on | always generated | keep; harmless CSRF belt-and-braces |
+| Device authorization grant (RFC 8628) | `grant = "device"` end-to-end (M2) | none |
 
-Conclusion: ortie has no 2.1-forbidden behavior to remove. Readiness is (a) making PKCE the default posture, (b) supporting the grants 2.1 keeps (authorization code, device via RFC 8628, refresh), and (c) leaning on RFC 8414 metadata so servers can tell us what they support.
+Conclusion: ortie has no 2.1-forbidden behavior to remove. PKCE-by-default and the grants 2.1 keeps (authorization code, device via RFC 8628, refresh) are in place. Remaining readiness is leaning harder on RFC 8414 metadata so servers can tell us what they support (M4).
 
 ## Design decisions
 
@@ -70,7 +71,7 @@ Recommended: no `version` config knob. 2.1 is a constraint profile of 2.0, not a
 
 ### D4: extras passthrough
 
-Recommended: a raw account-level table forwarded verbatim into the configured grant's initiation request: the authorization URL query for the authorization code grant (io-oauth Oauth20AuthorizationRequestParams.extras), the device authorization request body for the device grant.
+Recommended: a raw account-level table forwarded verbatim into the authorization-code initiation request query (io-oauth `Oauth20AuthRequestParams.extras`). Authorization-code wiring landed in M1. The device path does not forward extras: io-oauth `Oauth20DeviceAuthRequestParams` has only `client_id` and `scope` (belongs in io-oauth first per CONTRIBUTING).
 
 ```toml
 [accounts.example.extras]
@@ -94,14 +95,7 @@ Rejected: toml_edit write-back into the config file. It would create a maintenan
 
 ## Milestones
 
-M0, M1 and M5 landed in the 2.0.0 release. M2 landed after 2.0.0 (see Landed). Remaining: M3, then M4 and M6.
-
-### M2: device authorization grant end-to-end
-
-- Add the endpoints.device-authorization config field (deferred from M1) and its Account counterpart.
-- auth get dispatches on the configured grant (D5); `grant = "device"` becomes runnable: device authorization request, user-code display, polling loop, storage write, on-issue hooks (shared with the code grant path). The grant = "device" bail placeholders in auth get / auth resume go away.
-- auth resume interprets its positional per the account's grant: redirected URI (authorization code) or device code (device); authorization-code-only flags rejected on device accounts.
-- No io-oauth work needed; everything exists.
+M0, M1 and M5 landed in the 2.0.0 release. M2 (device authorization grant) landed after 2.0.0 (see Landed). Remaining: M3, then M4 and M6.
 
 ### M3: release polish
 

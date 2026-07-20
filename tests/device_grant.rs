@@ -97,6 +97,19 @@ storage.write.command = ["tee", "{t}"]
     assert!(get.status.success(), "{get:?}");
     let v: Value = serde_json::from_slice(&get.stdout).unwrap();
     assert_eq!(v["device_code"], "dc-test");
+    assert_eq!(v["user_code"], "USER");
+    // Entra-shaped mock omits verification_uri_complete; JSON must not invent one.
+    assert!(
+        v["verification_uri_complete"].is_null(),
+        "complete URI must be null when omitted: {v}"
+    );
+    assert!(
+        v["verification_uri"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&addr.to_string()),
+        "verification_uri missing: {v}"
+    );
     assert_eq!(polls.load(Ordering::SeqCst), 0);
 
     let resume = Command::new(&bin)

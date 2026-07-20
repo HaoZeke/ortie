@@ -173,7 +173,7 @@ impl AuthGetCommand {
 /// redirect: a non-interactive shell, a private-use redirection
 /// scheme, or a listener that failed to bind.
 fn print_manual_resume(state: &Oauth20State, pkce: Option<&Oauth20PkceCodeVerifier>) {
-    let state = String::from_utf8_lossy(state.expose());
+    let state = shell_single_quote(&String::from_utf8_lossy(state.expose()));
 
     println!(
         "Once authorized, copy the URL your browser was redirected to, \
@@ -183,14 +183,15 @@ fn print_manual_resume(state: &Oauth20State, pkce: Option<&Oauth20PkceCodeVerifi
 
     match pkce {
         Some(verifier) => {
-            let verifier = String::from_utf8_lossy(verifier.expose());
+            let verifier = shell_single_quote(&String::from_utf8_lossy(verifier.expose()));
             println!("> ortie auth resume --state {state} --pkce {verifier} <REDIRECTED_URI>");
         }
         None => {
-            println!("> ortie auth resume <REDIRECTED_URI> --state {state} <REDIRECTED_URI>");
+            println!("> ortie auth resume <REDIRECTED_URI> --state {state}");
         }
     }
 }
+
 
 /// Whether the redirection can be serviced by the local listener:
 /// an http(s) URL bound to a loopback host. Any other redirection (a
@@ -319,7 +320,10 @@ fn execute_device(printer: &mut impl Printer, mut account: Account) -> Result<()
             println!();
             println!("Once authorized, run:");
             println!();
-            println!("> ortie auth resume {}", view.device_code);
+            println!(
+                "> ortie auth resume {}",
+                shell_single_quote(&view.device_code)
+            );
         }
         return Ok(());
     }
@@ -384,6 +388,22 @@ pub(crate) fn report_token_issued(
     printer.out(Message::new(msg))
 }
 
+
+/// Single-quotes `s` for safe paste into a POSIX shell command line.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 #[derive(Serialize)]
 struct DeviceAuthorization {
     device_code: String,
@@ -414,5 +434,47 @@ impl fmt::Display for DeviceAuthorization {
             "Navigate to {} and enter the code {}",
             self.verification_uri, self.user_code
         )
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use io_oauth::rfc8628::auth::Oauth20DeviceAuthSuccessParams;
+    use secrecy::ExposeSecret;
+
+    #[test]
+    fn device_authorization_view_handles_missing_complete_uri() {
+        // Microsoft Entra omits verification_uri_complete on v2.0 device
+        // responses; open and Display must fall back to verification_uri.
+        let device = Oauth20DeviceAuthSuccessParams {
+            device_code: "entra-device-secret".into(),
+            user_code: "EUPEUAM9D".into(),
+            verification_uri: "https://login.microsoft.com/device".into(),
+            verification_uri_complete: None,
+            expires_in: 900,
+            interval: 5,
+        };
+        let view = DeviceAuthorization {
+            device_code: device.device_code.expose_secret().to_owned(),
+            user_code: device.user_code.clone(),
+            verification_uri: device.verification_uri.clone(),
+            verification_uri_complete: device.verification_uri_complete.clone(),
+            expires_in: device.expires_in,
+            interval: device.interval,
+            interactive: true,
+        };
+        let open_uri = device
+            .verification_uri_complete
+            .as_deref()
+            .unwrap_or(device.verification_uri.as_str());
+        assert_eq!(open_uri, "https://login.microsoft.com/device");
+        let text = view.to_string();
+        assert!(text.contains("EUPEUAM9D"));
+        assert!(text.contains("https://login.microsoft.com/device"));
+        assert!(!text.contains("complete URI:"), "{text}");
+        assert!(!text.contains("Or navigate directly"), "{text}");
+        assert!(!text.contains("entra-device-secret"), "{text}");
     }
 }

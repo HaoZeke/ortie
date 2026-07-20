@@ -47,7 +47,25 @@ is an ortie-local stopgap rather than discovery-driven) lives in
   `https://graph.microsoft.com/*` scopes (see the Microsoft Graph recipe in
   `config.sample.toml`). Personal Microsoft accounts may receive an opaque token
   the Graph API rejects with `InvalidAuthenticationToken`.
-- Device grant: `grant = "device"` with `…/oauth2/v2.0/devicecode` and matching `…/token`.
+- Device grant: set `grant = "device"` with the **v2.0** endpoints
+  `endpoints.device-authorization =
+  "https://login.microsoftonline.com/<tenant>/oauth2/v2.0/devicecode"` and the
+  matching `endpoints.token` (`…/oauth2/v2.0/token`). Do not use the legacy
+  `/oauth2/devicecode` (no `v2.0`): it returns `verification_url` (not RFC 8628
+  `verification_uri`) and string-typed lifetimes that fail to parse. Tenant
+  segment: `common` (work/school + personal; matches the authorization-code
+  recipes), `organizations` (work/school only), `consumers` (personal only), or
+  a directory id. The Thunderbird public client id
+  (`9e5f94bc-e8a4-4e73-b8be-63364c29d753`) works for the device grant with the
+  Outlook IMAP/SMTP scopes above. Entra never returns
+  `verification_uri_complete`; that omission is normal — `auth get` falls back
+  to `verification_uri` (typically `https://login.microsoft.com/device` for
+  common/organizations, `https://www.microsoft.com/link` for consumers).
+  Interactive shells poll; non-interactive sessions finish with
+  `auth resume <DEVICE_CODE>`. Device-code OAuth is a known phishing vector:
+  only approve a code you yourself requested from a trusted process. Some
+  tenants disable the device grant via Conditional Access even when the
+  authorization-code grant works.
 
 ## Fastmail
 

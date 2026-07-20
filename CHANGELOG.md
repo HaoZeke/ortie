@@ -12,6 +12,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   with `endpoints.device-authorization`. Interactive `auth get` polls;
   non-interactive / `--json` hands off to `auth resume <DEVICE_CODE>`.
 
+### Changed
+
+- `auth resume` positional is grant-interpreted (`URI|DEVICE_CODE`):
+  redirected URI for authorization-code accounts, device code for device
+  accounts. Authorization-code-only flags are rejected on device accounts.
+
+- Microsoft device-grant sample and `docs/providers.md` document Entra
+  tenants (`common` / `organizations` / `consumers` / directory id), v2.0
+  endpoints, `outlook.office.com` scopes (not `office365`), Thunderbird
+  public client id, and Entra's omission of `verification_uri_complete`.
+
 ## [2.0.0] - 2026-07-17
 
 ### Added
